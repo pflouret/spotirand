@@ -1,9 +1,9 @@
+const DEV = false;
 const SPOTIFY_CLIENT_ID = 'bfcd4af94e774f3992f578aa3dfddd02';
-// const REMOTE_SPOTIFY_REDIRECT_URI = 'http://localhost:8000/?refresh';
-const REMOTE_SPOTIFY_REDIRECT_URI = 'https://pflouret.github.io/spotirand/?refresh';
+const REMOTE_SPOTIFY_REDIRECT_URI = DEV ? 'http://127.0.0.1:8000/?refresh' : 'https://pflouret.github.io/spotirand/?refresh';
+const SCOPES = "user-library-read user-follow-read";
 
 "use strict";
-var accessToken = null;
 var albums = [];
 var albnum = 0;
 
@@ -16,15 +16,105 @@ function error(msg) {
   }
 }
 
-function authorizeUser() {
-  document.location = `https://accounts.spotify.com/authorize?client_id=${SPOTIFY_CLIENT_ID}&response_type=token&scope=user-library-read&redirect_uri=${encodeURIComponent(REMOTE_SPOTIFY_REDIRECT_URI)}`;
-}
+const generateRandomString = (length) => {
+  const possible = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  const values = crypto.getRandomValues(new Uint8Array(length));
+  return values.reduce((acc, x) => acc + possible[x % possible.length], "");
+};
+
+const sha256 = async (plain) => {
+  const data = new TextEncoder().encode(plain);
+  return window.crypto.subtle.digest("SHA-256", data);
+};
+
+const base64encode = (input) => {
+  return btoa(String.fromCharCode(...new Uint8Array(input)))
+    .replace(/=/g, '')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_');
+};
+
+const authorizeUser = async () => {
+  const codeVerifier = generateRandomString(64);
+  localStorage.setItem("code_verifier", codeVerifier);
+
+  const params = {
+    response_type: "code",
+    client_id: SPOTIFY_CLIENT_ID,
+    SCOPES,
+    code_challenge_method: "S256",
+    code_challenge: base64encode(await sha256(codeVerifier)),
+    redirect_uri: REMOTE_SPOTIFY_REDIRECT_URI,
+  };
+
+  const authUrl = new URL("https://accounts.spotify.com/authorize");
+  authUrl.search = new URLSearchParams(params).toString();
+  window.location.href = authUrl.toString();
+};
+
+const getToken = async (code) => {
+  const url = "https://accounts.spotify.com/api/token";
+  const payload = {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: new URLSearchParams({
+      client_id: SPOTIFY_CLIENT_ID,
+      grant_type: "authorization_code",
+      code,
+      redirect_uri: REMOTE_SPOTIFY_REDIRECT_URI,
+      code_verifier: localStorage.getItem("code_verifier")
+    }),
+  };
+
+  const response = await fetch(url, payload);
+  const body = await response.json();
+
+  if (response.ok) {
+    localStorage.setItem("access_token", body.access_token);
+    if (body.refresh_token) {
+      localStorage.setItem('refresh_token', body.refresh_token);
+    }
+  }
+};
+
+const refreshToken = async () => {
+  if (!'refresh_token' in localStorage) {
+    return false;
+  }
+
+  const refreshToken = localStorage.getItem('refresh_token');
+
+  const payload = {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded'
+    },
+    body: new URLSearchParams({
+      grant_type: 'refresh_token',
+      refresh_token: refreshToken,
+      client_id: SPOTIFY_CLIENT_ID
+    }),
+  };
+  const response = await fetch("https://accounts.spotify.com/api/token", payload);
+  const body = await response.json();
+
+  if (response.ok) {
+    localStorage.setItem('access_token', body.access_token);
+    if (body.refresh_token) {
+      localStorage.setItem('refresh_token', body.refresh_token);
+    }
+  }
+
+  return response.ok;
+};
 
 function fetchCurrentUserProfile(callback) {
-  callSpotify('https://api.spotify.com/v1/me', null, 'GET', callback);
+  callSpotify("https://api.spotify.com/v1/me", null, "GET", callback);
 }
 function fetchSavedAlbums(offset, callback) {
-  callSpotify(('https://api.spotify.com/v1/me/albums?limit=50&offset=' + offset), {}, 'GET', callback);
+  callSpotify(("https://api.spotify.com/v1/me/albums?limit=50&offset=" + offset), {}, "GET", callback);
 }
 
 function collectAlbums(albumsResponse) {
@@ -63,7 +153,7 @@ function collectAlbums(albumsResponse) {
 }
 
 function saveAlbums() {
-  window.localStorage.setItem("albums", JSON.stringify(albums, null, 2));
+  localStorage.setItem("albums", JSON.stringify(albums, null, 2));
 }
 
 function buildSlider(batchnum) {
@@ -94,7 +184,7 @@ function callSpotify(url, data, method, callback) {
     dataType: 'json',
     data: data,
     headers: {
-      'Authorization': `Bearer ${accessToken}`
+      'Authorization': `Bearer ${localStorage.getItem("access_token")}`
     },
     success: (r) => { callback(r); },
     error: (r) => {
@@ -102,6 +192,7 @@ function callSpotify(url, data, method, callback) {
         console.log('502 or 500 Error. Trying again');
         callSpotify(url, data, method, callback);
       } else {
+        localStorage.removeItem("access_token");
         callback(null);
         error(r.responseJSON.error.status + ': ' + r.responseJSON.error.message + '<br/><a href="">Go back and try again</a>.');
         console.log(r);
@@ -120,31 +211,46 @@ $(document).ready(() => {
   });
 
   const refreshAlbums = new URLSearchParams(window.location.search).has("refresh");
-  if (!refreshAlbums && "albums" in window.localStorage) {
-    albums = _.shuffle(JSON.parse(window.localStorage["albums"]));
+  if (!DEV && !refreshAlbums && "albums" in localStorage) {
+    albums = _.shuffle(JSON.parse(localStorage["albums"]));
     buildSlider(0);
     return;
   }
 
-  const args = new URLSearchParams(window.location.hash.substring(1));
-  if (args.has('access_token')) {
-    accessToken = args.get('access_token');
-    fetchCurrentUserProfile((user) => {
-      if (user) {
-        $('.loadingmessage').removeClass('hidden');
-        fetchSavedAlbums(0, (data) => {
-          if (data) {
-            collectAlbums(data);
-          } else {
-            error('Trouble getting your saved albums<br/><a href="">Go back and try again</a>.');
-          }
-        });
-        history.pushState("", document.title, window.location.pathname);
-      } else {
-        error('Trouble getting the user profile. <a href="">Go back and try again</a>.');
-      }
-    });
+  if (localStorage.getItem("access_token")) {
+    handlePostAuth();
+    return;
+  }
+
+  const args = new URLSearchParams(window.location.search);
+  if (args.has('code')) {
+    let code = args.get('code');
+    getToken(code).then(handlePostAuth);
   } else {
-    authorizeUser();
+    refreshToken().then((ok) => ok ? handlePostAuth() : authorizeUser())
   }
 });
+
+function handlePostAuth() {
+  if (DEV) {
+    console.log(localStorage.getItem("access_token"));
+    history.pushState("", document.title, window.location.pathname);
+    return;
+  }
+
+  fetchCurrentUserProfile((user) => {
+    if (user) {
+      $('.loadingmessage').removeClass('hidden');
+      fetchSavedAlbums(0, (data) => {
+        if (data) {
+          collectAlbums(data);
+        } else {
+          error('Trouble getting your saved albums<br/><a href="">Go back and try again</a>.');
+        }
+      });
+      history.pushState("", document.title, window.location.pathname);
+    } else {
+      error('Trouble getting the user profile. <a href="">Go back and try again</a>.');
+    }
+  });
+}
